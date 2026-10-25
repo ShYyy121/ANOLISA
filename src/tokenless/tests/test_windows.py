@@ -5,10 +5,8 @@ Run after scripts/build-windows.ps1 and npm/scripts/package-npm.js --target win3
 """
 
 import importlib.util
-from contextlib import closing
 import json
 import os
-from pathlib import Path
 import re
 import shutil
 import sqlite3
@@ -17,6 +15,8 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from contextlib import closing
+from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -225,6 +225,167 @@ class WindowsHookTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == "win32", "requires native Windows")
 class WindowsPackagingTests(unittest.TestCase):
+    """Cover artifact staging and packaging in the Windows CI class selector."""
+
+    def setUp(self) -> None:
+        sandbox = tempfile.TemporaryDirectory(prefix="tokenless build \u4e2d\u6587 '")
+        self.addCleanup(sandbox.cleanup)
+        self.root = Path(sandbox.name)
+        self.component = self.root / "tokenless"
+        self.rtk = self.component / "third_party/rtk"
+        scripts = self.component / "scripts"
+        scripts.mkdir(parents=True)
+        self.rtk.mkdir(parents=True)
+        for name in ("build-windows.ps1", "setup-rtk.sh"):
+            shutil.copyfile(ROOT / "scripts" / name, scripts / name)
+        setup = (scripts / "setup-rtk.sh").read_text(encoding="utf-8")
+        self.revision = re.search(r'^RTK_COMMIT="([0-9a-f]{40})"', setup, re.M).group(1)
+        (self.rtk / ".anolisa-rtk-commit").write_text(self.revision, encoding="utf-8")
+        self.metadata = self.root / "metadata.py"
+        self.metadata.write_text(
+            "import json, sys\n"
+            "sys.stdout.buffer.write(json.dumps({'target_directory': sys.argv[1]}, "
+            "ensure_ascii=False).encode('utf-8'))\n",
+            encoding="utf-8",
+        )
+        self.driver = self.root / "driver.ps1"
+        self.driver.write_text(
+            r"""
+$ErrorActionPreference = 'Stop'
+function git {
+    $global:LASTEXITCODE = 0
+    $env:TOKENLESS_TEST_REVISION
+}
+function cargo {
+    $manifestIndex = [array]::IndexOf($args, '--manifest-path')
+    if ($manifestIndex -lt 0) { throw 'Missing manifest path' }
+    $project = Split-Path $args[$manifestIndex + 1] -Parent
+    $binary = if ((Split-Path $project -Leaf) -eq 'rtk') { 'rtk' } else { 'tokenless' }
+    $target = Join-Path $project 'target'
+    if ($env:CARGO_TARGET_DIR) { $target = $env:CARGO_TARGET_DIR }
+    if ($env:TOKENLESS_TEST_DISTINCT_TARGETS -eq '1') {
+        $target = Join-Path $project 'configured output'
+    }
+    $global:LASTEXITCODE = 0
+    if ($args[0] -eq 'metadata') {
+        if ($args -notcontains '--no-deps' -or $args -notcontains '--locked') {
+            throw 'Metadata must preserve the lockfile and exclude dependencies'
+        }
+        $formatIndex = [array]::IndexOf($args, '--format-version')
+        if ($formatIndex -lt 0 -or $args[$formatIndex + 1] -ne '1') {
+            throw 'Metadata must use format version 1'
+        }
+        if ($env:TOKENLESS_TEST_BAD_METADATA -eq $binary) {
+            $global:LASTEXITCODE = 1
+            return
+        }
+        if ($env:TOKENLESS_TEST_RELATIVE_METADATA -eq $binary) { $target = 'target' }
+        & $env:TOKENLESS_TEST_PYTHON $env:TOKENLESS_TEST_METADATA $target
+    } elseif ($args[0] -eq 'build') {
+        if ($args -notcontains '--locked') { throw 'Build must preserve the lockfile' }
+        $targetIndex = [array]::IndexOf($args, '--target')
+        if ($targetIndex -lt 0 -or $args[$targetIndex + 1] -ne 'x86_64-pc-windows-msvc') {
+            throw 'Build must use the Windows MSVC target'
+        }
+        $profile = if ($args -contains '--release') { 'release' } else { 'debug' }
+        $directory = Join-Path $target "x86_64-pc-windows-msvc/$profile"
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path $directory "$binary.exe"), "fresh $binary $profile")
+    } else { throw "Unexpected Cargo command: $($args[0])" }
+}
+$build = Join-Path $env:TOKENLESS_TEST_COMPONENT 'scripts/build-windows.ps1'
+[Console]::OutputEncoding = [Text.Encoding]::GetEncoding(437)
+try {
+    & $build -Debug:($env:TOKENLESS_TEST_DEBUG -eq '1')
+} finally {
+    if ([Console]::OutputEncoding.CodePage -ne 437) { throw 'Console encoding was not restored' }
+}
+""",
+            encoding="utf-8",
+        )
+
+    def run_build(self, **overrides: str) -> subprocess.CompletedProcess[str]:
+        environment = {
+            **{
+                key: value
+                for key, value in os.environ.items()
+                if key.upper() not in {"CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"}
+            },
+            "TOKENLESS_TEST_COMPONENT": str(self.component),
+            "TOKENLESS_TEST_REVISION": self.revision,
+            "TOKENLESS_TEST_PYTHON": sys.executable,
+            "TOKENLESS_TEST_METADATA": str(self.metadata),
+            "TOKENLESS_TEST_DISTINCT_TARGETS": "",
+            "TOKENLESS_TEST_BAD_METADATA": "",
+            "TOKENLESS_TEST_RELATIVE_METADATA": "",
+            "TOKENLESS_TEST_DEBUG": "",
+            **overrides,
+        }
+        return subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(self.driver),
+            ],
+            cwd=self.root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+
+    def assert_staged(self, result: subprocess.CompletedProcess[str], profile: str) -> None:
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        output = self.component / "target/npm-prebuilt/win32-x64"
+        for binary in ("tokenless", "rtk"):
+            self.assertEqual(
+                (output / f"{binary}.exe").read_text(encoding="utf-8"), f"fresh {binary} {profile}"
+            )
+
+    def test_default_build_directories(self) -> None:
+        self.assert_staged(self.run_build(), "release")
+
+    def test_shared_target_directory_without_default_artifacts(self) -> None:
+        self.assert_staged(
+            self.run_build(CARGO_TARGET_DIR=str(self.root / "shared cache")), "release"
+        )
+
+    def test_shared_target_directory_does_not_publish_stale_binaries(self) -> None:
+        for project, binary in ((self.component, "tokenless"), (self.rtk, "rtk")):
+            path = project / "target/x86_64-pc-windows-msvc/release" / f"{binary}.exe"
+            path.parent.mkdir(parents=True)
+            path.write_text("stale executable", encoding="utf-8")
+        self.assert_staged(
+            self.run_build(CARGO_TARGET_DIR=str(self.root / "shared cache")), "release"
+        )
+
+    def test_distinct_metadata_targets_and_debug_profile(self) -> None:
+        self.assert_staged(
+            self.run_build(TOKENLESS_TEST_DISTINCT_TARGETS="1", TOKENLESS_TEST_DEBUG="1"), "debug"
+        )
+
+    def test_metadata_failure_does_not_publish_binaries(self) -> None:
+        for binary in ("tokenless", "rtk"):
+            with self.subTest(binary=binary):
+                result = self.run_build(TOKENLESS_TEST_BAD_METADATA=binary)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Cargo metadata failed", result.stderr)
+                self.assertFalse((self.component / "target/npm-prebuilt/win32-x64").exists())
+
+    def test_relative_metadata_does_not_publish_binaries(self) -> None:
+        for binary in ("tokenless", "rtk"):
+            with self.subTest(binary=binary):
+                result = self.run_build(TOKENLESS_TEST_RELATIVE_METADATA=binary)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Cargo metadata has no absolute target directory", result.stderr)
+                self.assertFalse((self.component / "target/npm-prebuilt/win32-x64").exists())
+
     def test_text_symlink_materialization_excludes_build_artifacts(self):
         shared = ROOT / "adapters/tokenless/qwenwork/hooks/shared"
         if shared.is_symlink():

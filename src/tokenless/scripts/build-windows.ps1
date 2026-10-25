@@ -2,6 +2,22 @@ param([switch]$Debug)
 $ErrorActionPreference = 'Stop'
 $component = Split-Path $PSScriptRoot -Parent
 $rtk = Join-Path $component 'third_party/rtk'
+function Get-CargoTargetDirectory([string]$Manifest) {
+    # Cargo resolves build.target-dir too; PS 5.1 needs UTF-8 decoding (PS 7 defaults to it).
+    $previousEncoding = [Console]::OutputEncoding
+    try {
+        [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+        $metadata = & cargo metadata --format-version 1 --no-deps --locked --manifest-path $Manifest
+        if ($LASTEXITCODE -ne 0) { throw "Cargo metadata failed for $Manifest" }
+        $directory = ($metadata | ConvertFrom-Json).target_directory
+        if (!$directory -or ![IO.Path]::IsPathRooted($directory)) {
+            throw "Cargo metadata has no absolute target directory for $Manifest"
+        }
+        return $directory
+    } finally {
+        [Console]::OutputEncoding = $previousEncoding
+    }
+}
 # The existing setup script remains the single source of the pinned revision.
 $source = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'setup-rtk.sh') -Raw
 $revision = [regex]::Match($source, '(?m)^RTK_COMMIT="([0-9a-f]{40})"').Groups[1].Value
@@ -35,12 +51,15 @@ if (Test-Path -LiteralPath $rtk) {
 $buildArgs = @('build', '--locked', '--target', 'x86_64-pc-windows-msvc')
 $profile = 'debug'
 if (!$Debug) { $buildArgs += '--release'; $profile = 'release' }
+$componentTarget = Get-CargoTargetDirectory (Join-Path $component 'Cargo.toml')
+$rtkTarget = Get-CargoTargetDirectory (Join-Path $rtk 'Cargo.toml')
 & cargo @buildArgs --manifest-path (Join-Path $component 'Cargo.toml')
 if ($LASTEXITCODE -ne 0) { throw 'Tokenless build failed' }
 & cargo @buildArgs --manifest-path (Join-Path $rtk 'Cargo.toml')
 if ($LASTEXITCODE -ne 0) { throw 'RTK build failed' }
+# npm packaging consumes this fixed staging path even when Cargo output is redirected.
 $output = Join-Path $component 'target/npm-prebuilt/win32-x64'
 New-Item -ItemType Directory -Path $output -Force | Out-Null
-Copy-Item -LiteralPath (Join-Path $component "target/x86_64-pc-windows-msvc/$profile/tokenless.exe") -Destination $output
-Copy-Item -LiteralPath (Join-Path $rtk "target/x86_64-pc-windows-msvc/$profile/rtk.exe") -Destination $output
+Copy-Item -LiteralPath (Join-Path $componentTarget "x86_64-pc-windows-msvc/$profile/tokenless.exe") -Destination $output
+Copy-Item -LiteralPath (Join-Path $rtkTarget "x86_64-pc-windows-msvc/$profile/rtk.exe") -Destination $output
 Write-Output "Windows binaries: $output"
