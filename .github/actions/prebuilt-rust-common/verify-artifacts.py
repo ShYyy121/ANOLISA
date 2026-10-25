@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import re
 import sys
 import tarfile
 import zipfile
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -135,10 +137,14 @@ def validate_directory(
                 if not package.namelist() or package.testzip() is not None:
                     die(f"archive is empty or corrupt: {archive}")
         else:
-            with tarfile.open(archive, "r:gz") as package:
-                if not package.getmembers():
-                    die(f"archive is empty: {archive}")
-    except (OSError, tarfile.TarError, zipfile.BadZipFile) as error:
+            with gzip.open(archive, "rb") as compressed:
+                with tarfile.open(fileobj=compressed, mode="r:") as package:
+                    if not package.getmembers():
+                        die(f"archive is empty: {archive}")
+                # Tar end markers can precede gzip's CRC/size trailer and later members.
+                while compressed.read(1024 * 1024):
+                    pass
+    except (OSError, EOFError, zlib.error, tarfile.TarError, zipfile.BadZipFile) as error:
         die(f"cannot read archive {archive}: {error}")
 
     sbom = Path(f"{archive}.cdx.json")
